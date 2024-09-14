@@ -1,0 +1,154 @@
+租户集群资源同步
+背景
+租户在自身集群创建的资源对象，只有底层资源对象需同步到联邦集群中进行资源分配，为了避免租户集群的资源对象在联邦集群中冗余，租户创建的资源对象在调度后需直接同步到子集群，因此需要有一个中间组件对资源进行同步。
+名词解释
+租户集群（tenant cluster）：用户或业务方单独的k8s集群。vcluster、 virtual cluster均与该名词对应。
+联邦集群（federation cluster）：123平台的联邦集群，对应一个region（例如华南）。
+子集群（member cluster）：123平台具体业务集群。与clusternet member cluster概念对应。
+目标和非目标
+目标
+●租户集群创建的资源对象需同步到子集群中，保证租户集群中的资源状态与子集群中资源状态秒级同步。
+●租户集群创建的资源对象在同步到子集群中，资源对象需保障在1:1的比例中。
+●解决资源对象过多、租户集群和子集群过多时，产生的资源对象同步性能瓶颈问题。
+●保证同步组件的高可用性。
+整体架构
+
+组件说明
+tenant-manager
+对应vc-manager，该组件负责租户集群生命周期与状态的管理，详情请参考：https://doc.weixin.qq.com/doc/w3_Ac4A-wY7AGsZHm05xlCQzao6wjEXY?scode=AJEAIQdfAAoQJjmXG1Ac4A-wY7AGs 
+syncer
+该组件有两个职责：第一将租户集群创建的Pod转换成fed-pod 向联邦调度发送调度请求，确认该Pod同步到哪个子集群；第二向子集群填充租户创建的对象，并双向同步对象状态。定期扫描同步的对象，以确保租户控制平面和子集群之间的状态一致。部分代码复用vcluster，详细功能请见详细设计章节。syncer的整体设计及代码可复用vcluster项目。
+架构数据流介绍
+该数据流为租户集群资源同步数据流
+1、syncer组件  watch 租户集群create pod事件。
+2、syncer组件把租户集群的pod转换成联邦集群调度单元fed-pod，并为该fed-pod打上labels["tenant-name"]="tenantA"，用以区分正常的fed-pod，并且只关注自身租户Pod的调度信息。
+3、syncer感知到fed-pod调度后，把租户集群Pod创建到具体子集群即可，并为Pod打上租户labels["tenant-name"]="tenantA"。
+4、syncer watch 所有子集群和本租户相关的labels Pod，当Pod.status发生变化后即可同步到自己对应的租户集群。
+面临的挑战
+联邦层
+●为避免联邦层资源对象冗余，减少租户资源对象对联邦层ETCD照成的存储压力，我们需要把租户中的资源对象经过联邦的资源分配，直接下发到具体的member cluster中。
+子集群层
+●syncer需订阅联邦调度器的调度结果（fed-pod），由于子集群和fed-pod较多，watch 所有对象会照成子集群内syncer informer cache 膨胀，index 性能较低，为避免这种情况，syncer在订阅fed-pod时需加本集群label，减少子集群syncer与联邦apiserver的通信压力。
+●syncer 需watch 子集群中租户相关的pod.status变化，并把信息回传给租户集群，子集群内pod较多，为避免多余的pod信息，syncer需把非租户集群的pod给过滤掉，watch时只关注有租户label的pod即可。
+详细设计
+负载均衡
+为了保障租户资源同步的时效性和及时性，一个syncer组件对应一个租户集群，负责该租户集群所有资源的下发操作，满足一个租户内资源操作由一个组件负责的原则，从资源下发看syncer会对租户kube-apiserver有一个watch长链接（所有资源复用client）。从资源同步看syncer会对所有子集群kube-apiserver创建watch长链接，关注的resources只和自身负责的租户有关（当前联邦组件均使用该模式），syncer的链接总数为1+N（N为子集群个数），从syncer的性能和效率看可以满足当前场景需求，从架构上看并不会对k8s照成请求压力。
+高可用
+同一租户下的syncer为主备模式，当前只有master在工作。该块代码可复用k8s-scheduler的主备选举代码。
+数据同步
+syncer中把租户集群的resources同步到子集群称为Down（数据下传），把子集群的resouces.status同步回租户集群称为Up（数据上传）。
+Down
+
+数据流介绍
+1.syncer watch 租户集群resources的create事件。
+2.syncer 感知如果是pod则转换成fed-pod，向联邦调度器请求资源。
+3.fed-scheduler 调度fed-pod。
+4.syncer 感知到fed-pod调度，把租户集群相关pod创建到子集群中。
+关于链接数及性能
+syncer 当前对租户集群会保持一个长链接（watch），需及时感知租户集群资源的创建；对联邦集群会watch fed-pod，该fed-pod会打上该syncer负责的租户labels["tenant-name"]="tenantA"，减少watch的数据量；最后会使用短链接把各种资源对象创建到对应的子集群中，资源对象上都会打上租户对应的标签labels["tenant-name"]="tenantA"。 从链接数量上和数据处理量上看Down 数据流不具有数据处理性能压力，其链接数及对kube-apiserver的增加上看且是合理的，链接数在租户、联邦、子集群的比例上1长:1长:N短。
+关于调度
+一个pod转换成一个fed-pod对联邦调度器的调度性能带来了一定的挑战和压力，为了增加联邦调度器的调度效率，我们可对此处进行一定的优化。这里有三种转换场景：
+1.租户集群创建原生k8s workload：可直接把workload转换成fed-pod，资源分配完毕后，拉取租户集群创建的对应pod，进行随机下发同步。
+2.租户集群创建自定义workload：syncer不可能识别所有类型的workload，syncer可每2秒对新创建的pod根据resources.request进行聚合，并转换成对应的fed-pod，资源分配完毕后随机对pod进行下发同步。
+3.租户集群创建Pod：如聚合不到同resource.request的Pod时，只能退化成一个fed-pod.replicas=1的情况。
+其他资源对象的同步
+租户集群创建的其他资源对象（configmap、secret、endpoints、namespace等），我们不可能无脑同步到所有的子集群中，由于子集群较多，资源对象膨胀比太大，会导致太多的垃圾数据被创建出不利于资源对象管理。这时需采用“用时复制”策略，k8s中所有的资源对象都是为Pod来提供服务的，在Pod创建到子集群时，需要感知到该Pod使用了哪些资源对象，并提前把这些资源对象同步到子集群中。具体请参考[resources对象同步]章节。
+Up
+
+数据流介绍
+1.syncer会对每个子集群创建一个长链接watch 并带上labels["tenant-name"]="tenantA"；订阅只和自身租户相关的资源对象。
+2.当资源对象状态发生变化后，syncer把该状态同步回对应租户集群。
+关于链接数及性能
+syncer 对每个子集群都有会建立一个长链接，watch子集群该租户对象的更新事件，订阅含有labels["tenant-name"]="tenantA"的资源对象。子集群对象更新时syncer使用租户集群的短链接进行资源同步；链接数在租户、子集群的比例上1短:N长；当有M个租户时该链接比例为M短:M*N长。
+Resources对象同步
+用时同步
+k8s中各种资源对象都是为Pod提供服务的，由于租户集群的Pod会被同步到不同的子集群中，Pod启动前它所需的其他资源对象需必须存在，便于kubelet为其进行挂载；目前用时同步策略只适用于配置相关资源对象（ConfigMap、Secret、PersistentVolume），并且只支持以下三种方式时才会同步：
+1.在容器命令和参数内
+2.容器的环境变量
+3.在只读卷里面添加一个文件，让应用来读取
+如果Pod使用Kubernetes API 来读取 ConfigMap方式，该Pod需RBAC认证并且需要链接到租户集群，该方式可以参考[Operator功能支持]章节的内容。
+当租户集群的Pod资源分配后，syncer需识别Pod如下信息是否使用到了配置功能：
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmap-demo-pod
+spec:
+  containers:
+    - name: demo
+      image: alpine
+      command: ["sleep", "3600"]
+      env:
+        # 定义环境变量
+        - name: PLAYER_INITIAL_LIVES # 请注意这里和 ConfigMap 中的键名是不一样的
+          valueFrom:
+            configMapKeyRef:
+              name: game-demo        # 这个值来自 ConfigMap
+  volumes:
+  # 你可以在 Pod 级别设置卷，然后将其挂载到 Pod 内的容器中
+  - name: config
+    configMap:
+      # 提供你想要挂载的 ConfigMap 的名字
+      name: game-demo
+      # 来自 ConfigMap 的一组键，将被创建为文件
+      items:
+      - key: "game.properties"
+        path: "game.properties"
+
+
+如使用到了configMap、Secret时，需先同步该资源对象到子集群中，需在syncer内存中为该资源对象建立映射关系，便于租户集群资源更新后直接同步到子集群中。
+平台需支持的能力
+原生k8s提供的资源类型包括以下几种：
+工作负载类：Deployment、ReplicaSet、StatefulSet、Job（排到二期）、DaemonSet（本次不做支持）。
+网络类：Service、Endpoints、DNS、NetworkPolicy（Ingress、egress）、负载均衡策略、Ingress。
+存储类：PersistentVolume、PersistentVolumeClaim、StorageClass。
+配置类：ConfigMap、Secret。
+安全类：ServiceAccounts、ClusterRolue、ClusterRolueBinding。
+策略类：LimitRange、ResourceQuota。
+当前syncer对应的是多个子集群，该块与原生是完全不一样的，所以资源不能无脑同步，像网络类即使进行同步也没有任何意义，因Pod和各类型资源都在子集群中，子集群间的Pod在k8s功能上相互隔离，导致功能无法生效，因此像网络类资源对象需借助admin的能力与公司产品进行打通，例如Service、DNS、负载均衡功能均可对接到北极星中，配置类相关功能可对接到七彩石，存储类相关功能可对接到CFS等。该块属于syncer能力之外，需admin进行详细设计。
+Operator模式支持
+为满足无量这类用户的使用需求，用户有Operator类型的Pod，需要链接到租户集群kube-apiserver中，对自定义CRD进行识别并创建对应的Pod。该类需求中用户的Operator Pod需要在租户集群进行RBAC认证，认证之后在启动Pod前会把租户集群的kube-apiserver信息及证书配置到container的环境变量及挂载目录中。
+RABC的功能由：ClusterRole、ClusterRoleBinding、ServiceAccount这三个来决定，即使 syncer把这三个对象无脑同步到某个子集群中，在拉起Operator Pod时，仍然会存在一个问题，kubelet链接的是子集群的kube-apiserver会为其配置子集群apiserver地址，Operator启动后会watch 子集群的CRD创建。如果syncer当前不具备自定义CRD同步能力，因为需要识别出其结构体，并且租户创建新的CRD时不具备自动化识别能力，所以syncer对该场景无解。
+第一种解：
+当前峰峦所使用的解决方案：为租户集群注册单独运行Operator的node，operator在部署时直接指定nodeName，在租户集群拉起Operator Pod即可。
+注： 有一个局限对于租户 workload 自身有需要访问租户集群的场景不支持。
+第二种解：
+在 Pod 从租户集群下发到子集群时，直接在容器的环境变量里面写上租户集群kube-apiserver的地址，相关的token以configmap的方式下发到子集群，并通过 volume 挂载到特定目录  (token 覆写的方式需要验证一下)
+注： 这个方式有点 hack ，不是 k8s  明文说的标准 ， 只是从其当前实现上看可以满足需求。
+该解法的原理：Operator会使用client-go链接kube-apiserver，链接kube-apiserver所必备的两个条件是，一是kube-apiserver的地址及端口、二是链接kube-apiserver所需证书或token，根据client-go该块的源码可知，kube-apiserver的地址及端口是从环境变量处获取，证书或token是通过volume进行挂载，具体代码请参考 ，两个必要条件如下：
+●Env: KUBERNETES_SERVICE_HOST、KUBERNETES_SERVICE_PORT
+●Volume：/var/run/secrets/kubernetes.io/serviceaccount/token
+子集群中Pod需要改造点如下：
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo-pod
+spec:
+  containers:
+    - name: demo
+      image: alpine
+      command: ["sleep", "3600"]
+      env:
+        # 定义环境变量
+        - name: KUBERNETES_SERVICE_HOST # kube-apiserver host环境变量
+          value: 租户集群kube-apiserver Host地址  # 租户集群kube-apiserver地址
+        - name: KUBERNETES_SERVICE_PORT 
+          value: 租户集群kube-apiserver端口  # 租户集群kube-apiserver端口
+  volumes:
+  - name: tenantA-secret-token # 该secret从租户集群同步到子集群即可
+    secret:
+      defaultMode: 420
+      secretName: tenantA-secret-token
+  volumeMounts:
+  - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: tenantA-secret-token # 租户集群RBAC认证的token挂载到Operator Pod中 
+      readOnly: true
+
+Failover内存数据恢复
+syncer 在重启后需要对租户集群、联邦集群和子集群的资源对象进行对账，需保持三个集群中的资源对象状态为最终一致性，整体failover流程如下：
+1.资源对象对账：拉取所有子集群该租户的资源对象与本租户集群资源对象进行对账，可以得到以下几种情况：
+a.子集群有该对象租户集群没有该对象：需把子集群中该对象进行删除。
+b.子集群没有该对象租户集群中有该对象：如果是Pod，需向联邦集群为该Pod申请资源进行下发同步。
+c.子集群资源对象与租户集群资源对象状态不一致：如果是Pod，则从子集群同步到租户集群，如果是其他资源对象，需从租户集群同步到子集群。
+d.子集群与租户集群资源对象状态一致，不进行任何操作。
+2.用时同步数据恢复：在资源对账时，需恢复Pod使用的资源对象在具体子集群的映射关系，这样便于租户集群资源对象更新后同步到具体子集群中。
+
